@@ -6,13 +6,31 @@
 // *********************************************************************************************************;
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+
 #include <OneWire.h>
 #include <DallasTemperature.h>
+#include <DHT.h>
+#include <DHT_U.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_ADS1X15.h>
+
+Adafruit_ADS1115 ads; /* Use this for the 16-bit version */
+
+#define TdsSensorPin 2
+#define VREF 3.3          // analog reference voltage(Volt) of the ADC
+#define SCOUNT 30         // sum of sample point
+int analogBuffer[SCOUNT]; // store the analog value in the array, read from ADC
+int analogBufferTemp[SCOUNT];
+int analogBufferIndex = 0, copyIndex = 0;
+float averageVoltage = 0, tdsValue = 0, temperature = 25;
+
+// *********************************************************************************************************;
+int getMedianNum(int bArray[], int iFilterLen);
+void loop2(void *parameter);
 
 //*********************************************** OLED ***********************************************************
 #define SCREEN_WIDTH 128 // OLED display width, in pixels
 #define SCREEN_HEIGHT 32 // OLED display height, in pixels
-
 // Declaration for an SSD1306 display connected to I2C (SDA, SCL pins)
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
@@ -27,15 +45,15 @@ const char *password = "armadillolan";
 // MQTT Broker
 const char *mqtt_broker = "192.168.1.43";
 const char *topic = "casa/aquarium";
+const char *topicLevel = "casa/aquarium/level";
+const char *topicTemp = "casa/aquarium/temp";
+const char *topicTds = "casa/aquarium/tds";
+
 const char *mqtt_username = "root";
 const char *mqtt_password = "orangepi.hass";
 const int mqtt_port = 1883;
 
 String client_id = "aquarium-";
-
-// define led on pin 15
-#define LED 15
-// *********************************************************************************************************;
 
 WiFiClient espClient;
 PubSubClient client(espClient);
@@ -43,75 +61,63 @@ PubSubClient client(espClient);
 void callback(char *topic, byte *payload, unsigned int length);
 void reconnect();
 void displayMQTTerror(int mqtterror);
-void loop2(void *parameter);
 
-// *********************************************************************************************************;
-// tds sensor
-#define TdsSensorPin A0
-#define VREF 5.0  // analog reference voltage(Volt) of the ADC
-#define SCOUNT 30 // sum of sample point
+//* *********************************************** Sensors ***********************************************************
 
-int analogBuffer[SCOUNT]; // store the analog value in the array, read from ADC
-int analogBufferTemp[SCOUNT];
-int analogBufferIndex = 0;
-int copyIndex = 0;
+#define CapacitiveLEVELPIN 3
 
-float averageVoltage = 0;
-float tdsValue = 0;
-float temperature = 16; // current temperature for compensation
+// define led on pin 15
+#define LED 15
 
-// median filtering algorithm
-int getMedianNum(int bArray[], int iFilterLen)
-{
-  int bTab[iFilterLen];
-  for (byte i = 0; i < iFilterLen; i++)
-    bTab[i] = bArray[i];
-  int i, j, bTemp;
-  for (j = 0; j < iFilterLen - 1; j++)
-  {
-    for (i = 0; i < iFilterLen - j - 1; i++)
-    {
-      if (bTab[i] > bTab[i + 1])
-      {
-        bTemp = bTab[i];
-        bTab[i] = bTab[i + 1];
-        bTab[i + 1] = bTemp;
-      }
-    }
-  }
-  if ((iFilterLen & 1) > 0)
-  {
-    bTemp = bTab[(iFilterLen - 1) / 2];
-  }
-  else
-  {
-    bTemp = (bTab[iFilterLen / 2] + bTab[iFilterLen / 2 - 1]) / 2;
-  }
-  return bTemp;
-}
+#define DHTPIN 1
+#define DHTTYPE DHT11
+// Inicializamos el sensor DHT11
+DHT dht(DHTPIN, DHTTYPE);
 
 // *********************************************************************************************************;
 // DS18B20 sensor
-
 // GPIO where the DS18B20 is connected to
 const int oneWireBus = 4;
-
 // Setup a oneWire instance to communicate with any OneWire devices
 OneWire oneWire(oneWireBus);
-
 // Pass our oneWire reference to Dallas Temperature sensor
 DallasTemperature sensors(&oneWire);
 
-// *********************************************************************************************************;
+// int adc_vref_to_gpio(11);
+//  variables
+
+float temperatureC = 0;
+float temperatureF = 0;
+float humidity = 0;
+float heatIndexC = 0;
+float heatIndexF = 0;
+float heatIndex = 0;
+
+int correction = 0;
+
+bool stateScreen = 0;
+float tdsValueCorrected = 0;
+int level = 0;
+
 void setup()
 {
-  // put your setup code here, to run once:
-  // Set software serial baud to 115200;
-  // define led
+  Serial.begin(115200);
+  pinMode(TdsSensorPin, INPUT);
   pinMode(LED, OUTPUT);
   digitalWrite(LED, LOW);
+  pinMode(CapacitiveLEVELPIN, INPUT);
 
-  Serial.begin(9600);
+  // ADS
+  //  Descomentar el que interese
+  //  ads.setGain(GAIN_TWOTHIRDS);  +/- 6.144V  1 bit = 0.1875mV (default)
+  //  ads.setGain(GAIN_ONE);        +/- 4.096V  1 bit = 0.125mV
+  //  ads.setGain(GAIN_TWO);        +/- 2.048V  1 bit = 0.0625mV
+  //  ads.setGain(GAIN_FOUR);       +/- 1.024V  1 bit = 0.03125mV
+  //  ads.setGain(GAIN_EIGHT);      +/- 0.512V  1 bit = 0.015625mV
+  //  ads.setGain(GAIN_SIXTEEN);    +/- 0.256V  1 bit = 0.0078125mV
+  ads.begin();
+  // Comenzamos el sensor DHT
+  dht.begin();
   Serial.println("Iniciando...");
   // Connecting to a WiFi network
   if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C))
@@ -120,10 +126,6 @@ void setup()
     for (;;)
       ;
   }
-  // Start the tds sensor
-  delay(2000);
-  pinMode(TdsSensorPin, INPUT);
-
   // Start the DS18B20 sensor
   sensors.begin();
 
@@ -131,15 +133,15 @@ void setup()
   display.clearDisplay();
   display.setTextSize(2);
   display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0, 10);
+  display.setCursor(15, 10);
   display.println("Aquarium");
   display.display();
   delay(2000);
   display.clearDisplay();
   display.setTextSize(2);
   display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0, 10);
-  display.println("V 0.0.1");
+  display.setCursor(15, 10);
+  display.println("V0.0.1");
   display.display();
   delay(1000);
   // Start the OLED display
@@ -149,10 +151,10 @@ void setup()
   display.setCursor(0, 0);
   display.println("Iniciando...");
   display.display();
-  // WiFi
-  // WiFi.mode(WIFI_STA); // Optional
+  // // WiFi
+  // // WiFi.mode(WIFI_STA); // Optional
   WiFi.begin(ssid, password);
-  WiFi.setTxPower(WIFI_POWER_8_5dBm);
+  // WiFi.setTxPower(WIFI_POWER_8_5dBm);
   Serial.println("\nConnecting");
   WiFi.begin(ssid, password);
   while (WiFi.status() != WL_CONNECTED)
@@ -174,9 +176,6 @@ void setup()
   // print mac address
   Serial.print("MAC address: ");
   Serial.println(WiFi.macAddress());
-
-  display.display();
-
   delay(5000);
 
   client.setKeepAlive(20860);
@@ -201,6 +200,7 @@ void setup()
     }
     delay(2000);
   }
+
   display.clearDisplay();
   display.setCursor(0, 0);
   display.println("WiFi: " + WiFi.localIP().toString());
@@ -209,6 +209,8 @@ void setup()
   display.display();
   // Publish and subscribe
   client.publish(topic, "Hi, I'm AQUARIUM ^^");
+  delay(3000);
+  stateScreen = HIGH;
 
   xTaskCreatePinnedToCore(
       loop2,  /* Function to implement the task */
@@ -224,96 +226,141 @@ void loop2(void *parameter)
   while (true)
   {
     client.loop();
-    delay(1000);
-  }
-}
-
-void loop()
-{
-  sensors.requestTemperatures();
-  float temperatureC = sensors.getTempCByIndex(0);
-  float temperatureF = sensors.getTempFByIndex(0);
-  Serial.print(temperatureC);
-  Serial.println("ºC");
-  Serial.print(temperatureF);
-  Serial.println("ºF");
-  delay(5000);
-
-  static unsigned long analogSampleTimepoint = millis();
-  if (millis() - analogSampleTimepoint > 40U)
-  { // every 40 milliseconds,read the analog value from the ADC
-    analogSampleTimepoint = millis();
-    analogBuffer[analogBufferIndex] = analogRead(TdsSensorPin); // read the analog value and store into the buffer
-    analogBufferIndex++;
-    if (analogBufferIndex == SCOUNT)
+    if (stateScreen == HIGH)
     {
-      analogBufferIndex = 0;
+
+      display.clearDisplay();
+      display.setTextSize(1);
+      display.setTextColor(SSD1306_WHITE);
+      display.setCursor(0, 0);
+      display.println("TDS: " + String((tdsValue / 100), 0) + " ppm"); // 1015 correction
+      display.setCursor(0, 10);
+      display.println("Temp: " + String(temperatureC) + " C");
+      display.setCursor(0, 20);
+      display.println("Level: " + String(level));
+      display.display();
+      delay(1000);
     }
   }
+}
+void loop()
+{
+  int16_t adc0;
+  adc0 = ads.readADC_SingleEnded(0);
 
+  static unsigned long analogSampleTimepoint = millis();
+
+  if (millis() - analogSampleTimepoint > 40U) // every 40 milliseconds,read the analog value from the ADC
+  {
+    analogSampleTimepoint = millis();
+    analogBuffer[analogBufferIndex] = adc0; // read the analog value and store into the buffer
+    analogBufferIndex++;
+    if (analogBufferIndex == SCOUNT)
+      analogBufferIndex = 0;
+  }
   static unsigned long printTimepoint = millis();
   if (millis() - printTimepoint > 800U)
   {
     printTimepoint = millis();
     for (copyIndex = 0; copyIndex < SCOUNT; copyIndex++)
-    {
       analogBufferTemp[copyIndex] = analogBuffer[copyIndex];
+    averageVoltage = getMedianNum(analogBufferTemp, SCOUNT) * (float)VREF / 1024.0;                                                                                                                   // read the analog value more stable by the median filtering algorithm, and convert to voltage value
+    float compensationCoefficient = 1.0 + 0.02 * (temperature - 25.0);                                                                                                                                // temperature compensation formula: fFinalResult(25^C) = fFinalResult(current)/(1.0+0.02*(fTP-25.0));
+    float compensationVolatge = averageVoltage / compensationCoefficient;                                                                                                                             // temperature compensation
+    tdsValue = (((133.42 * compensationVolatge * compensationVolatge * compensationVolatge - 255.86 * compensationVolatge * compensationVolatge + 857.39 * compensationVolatge) * 0.5) - correction); // convert voltage value to tds value
+                                                                                                                                                                                                      // Serial.print("voltage:");
+                                                                                                                                                                                                      // Serial.print(averageVoltage,2);
+                                                                                                                                                                                                      // Serial.print("V ");
+    // if (tdsValue < 0)
+    // {
+    //   tdsValue = 0;
+    // }
 
-      // read the analog value more stable by the median filtering algorithm, and convert to voltage value
-      averageVoltage = getMedianNum(analogBufferTemp, SCOUNT) * (float)VREF / 1024.0;
-
-      // temperature compensation formula: fFinalResult(25^C) = fFinalResult(current)/(1.0+0.02*(fTP-25.0));
-      float compensationCoefficient = 1.0 + 0.02 * (temperature - 25.0);
-      // temperature compensation
-      float compensationVoltage = averageVoltage / compensationCoefficient;
-
-      // convert voltage value to tds value
-      tdsValue = (133.42 * compensationVoltage * compensationVoltage * compensationVoltage - 255.86 * compensationVoltage * compensationVoltage + 857.39 * compensationVoltage) * 0.5;
-
-      // Serial.print("voltage:");
-      // Serial.print(averageVoltage,2);
-      // Serial.print("V   ");
-    }
+    Serial.println("***********************************");
     Serial.print("TDS Value:");
-    Serial.print(tdsValue, 0);
+    Serial.print(tdsValue / 100, 0);
     Serial.println("ppm");
   }
-}
 
-void reconnect()
-{
-  int contador_error = 0;
-  Serial.println("Bucle Reconectar");
-  // Loop hasta que estemos reconectados
-  while (!client.connected())
+  static unsigned long sondaTimepoint = millis();
+  if (millis() - sondaTimepoint > 1000)
   {
-    Serial.println("Intentando conexión MQTT...");
-    // Intentar conectar
-    if (client.connect(client_id.c_str(), mqtt_username, mqtt_password))
+    sondaTimepoint = millis();
+    // Leemos la humedad relativa
+    float h = dht.readHumidity();
+    // Leemos la temperatura en grados centígrados (por defecto)
+    float t = dht.readTemperature();
+    // Leemos la temperatura en grados Fahrenheit
+    float f = dht.readTemperature(true);
+
+    // Comprobamos si ha habido algún error en la lectura
+    if (isnan(h) || isnan(t) || isnan(f))
     {
-      Serial.println("conectado");
+      Serial.println("Error obteniendo los datos del sensor DHT11");
+      return;
     }
-    else
+
+    sensors.requestTemperatures();
+    temperatureC = sensors.getTempCByIndex(0);
+    temperatureF = sensors.getTempFByIndex(0);
+
+    Serial.print("Temperatura del Acuario: ");
+    Serial.print(temperatureC);
+    Serial.println("ºC");
+    // Calcular el índice de calor en Fahrenheit
+    float hif = dht.computeHeatIndex(f, h);
+    // Calcular el índice de calor en grados centígrados
+    float hic = dht.computeHeatIndex(t, h, false);
+
+    Serial.print("Temperatura de la Caja: ");
+    Serial.print(t);
+    Serial.println(" ºC ");
+    Serial.print("Humedad de la Caja: ");
+    Serial.print(h);
+    Serial.println(" %");
+    Serial.print("Indice de Calor: ");
+    Serial.print(hic);
+    Serial.println(" ºC ");
+    Serial.println("***********************************");
+
+    // read capacitive level
+    level = digitalRead(CapacitiveLEVELPIN);
+    Serial.print("Capacitive Level: ");
+    Serial.println(level);
+  }
+
+  static unsigned long dataPublishSampleTimepoint = millis();
+  if (millis() - dataPublishSampleTimepoint > 5000)
+  {
+    dataPublishSampleTimepoint = millis();
+    client.publish(topicLevel, String(level).c_str());
+    client.publish(topicTemp, String((temperatureC)).c_str());
+    client.publish(topicTds, String((int)(tdsValue / 100)).c_str());
+  }
+}
+int getMedianNum(int bArray[], int iFilterLen)
+{
+  int bTab[iFilterLen];
+  for (byte i = 0; i < iFilterLen; i++)
+    bTab[i] = bArray[i];
+  int i, j, bTemp;
+  for (j = 0; j < iFilterLen - 1; j++)
+  {
+    for (i = 0; i < iFilterLen - j - 1; i++)
     {
-      Serial.print("COmunicacion MQTT falló, rc=");
-      Serial.println(client.state());
-      Serial.println("Intentar de nuevo en 5 segundos");
-      delay(500);
-
-      // Esperar 5 segundos antes de volver a intentar
-      displayMQTTerror(client.state());
-
-      delay(5000);
-      contador_error++;
-      if (contador_error > 10)
+      if (bTab[i] > bTab[i + 1])
       {
-        Serial.println("Reiniciando ESP");
-
-        ESP.restart();
+        bTemp = bTab[i];
+        bTab[i] = bTab[i + 1];
+        bTab[i + 1] = bTemp;
       }
-      Serial.println("Intento " + String(contador_error));
     }
   }
+  if ((iFilterLen & 1) > 0)
+    bTemp = bTab[(iFilterLen - 1) / 2];
+  else
+    bTemp = (bTab[iFilterLen / 2] + bTab[iFilterLen / 2 - 1]) / 2;
+  return bTemp;
 }
 bool checkBound(float newValue, float prevValue, float maxDiff)
 {
