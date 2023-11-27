@@ -27,6 +27,7 @@ float averageVoltage = 0, tdsValue = 0, temperature = 25;
 // *********************************************************************************************************;
 int getMedianNum(int bArray[], int iFilterLen);
 void loop2(void *parameter);
+bool checkBound(float newValue, float prevValue, float maxDiff);
 
 //*********************************************** OLED ***********************************************************
 #define SCREEN_WIDTH 128 // OLED display width, in pixels
@@ -48,6 +49,7 @@ const char *topic = "casa/aquarium";
 const char *topicLevel = "casa/aquarium/level";
 const char *topicTemp = "casa/aquarium/temp";
 const char *topicTds = "casa/aquarium/tds";
+const char *topicHum = "casa/aquarium/hum";
 
 const char *mqtt_username = "root";
 const char *mqtt_password = "orangepi.hass";
@@ -98,6 +100,18 @@ int correction = 0;
 bool stateScreen = 0;
 float tdsValueCorrected = 0;
 int level = 0;
+
+float h = 0;
+// Leemos la temperatura en grados centígrados (por defecto)
+float t = 0;
+// create a variable to use checkBound function
+float prevTemp = 0;
+float prevHum = 0;
+float prevHeatIndex = 0;
+float prevTds = 0;
+float prevLevel = 0;
+float prevTempBox = 0;
+float prevHumBox = 0;
 
 void setup()
 {
@@ -287,9 +301,9 @@ void loop()
   {
     sondaTimepoint = millis();
     // Leemos la humedad relativa
-    float h = dht.readHumidity();
+    h = dht.readHumidity();
     // Leemos la temperatura en grados centígrados (por defecto)
-    float t = dht.readTemperature();
+    t = dht.readTemperature();
     // Leemos la temperatura en grados Fahrenheit
     float f = dht.readTemperature(true);
 
@@ -333,9 +347,40 @@ void loop()
   if (millis() - dataPublishSampleTimepoint > 5000)
   {
     dataPublishSampleTimepoint = millis();
-    client.publish(topicLevel, String(level).c_str());
-    client.publish(topicTemp, String((temperatureC)).c_str());
-    client.publish(topicTds, String((int)(tdsValue / 100)).c_str());
+
+    // Using checkBound function to check the data
+    if (checkBound(temperatureC, prevTemp, 0.5))
+    {
+      prevTemp = temperatureC;
+      client.publish(topicTemp, String(temperatureC).c_str());
+    }
+    if (checkBound(tdsValue, prevTds, 1))
+    {
+      prevTds = tdsValue;
+      client.publish(topicTds, String((int)(tdsValue / 100)).c_str());
+    }
+    if (checkBound(level, prevLevel, 0.1))
+    {
+      prevLevel = level;
+      client.publish(topicLevel, String(level).c_str());
+    }
+    // send box temperature and humidity
+    if (checkBound(t, prevTempBox, 0.1))
+    {
+      if (t < 40)
+      {
+        prevTempBox = t;
+        client.publish("casa/aquarium/box/temp", String((int)(t)).c_str());
+      }
+    }
+    if (checkBound(h, prevHumBox, 0.1))
+    {
+      if (h < 100 && h > 0)
+      {
+        prevHumBox = h;
+        client.publish("casa/aquarium/box/hum", String((int)(h)).c_str());
+      }
+    }
   }
 }
 int getMedianNum(int bArray[], int iFilterLen)
